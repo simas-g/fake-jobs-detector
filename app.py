@@ -111,7 +111,8 @@ st.caption("Moderation support for the trust and safety team: which listing trai
            "confirmed scams, and a verdict for new postings, explained by the 3 most similar "
            "reviewed postings.")
 if backend.startswith("SQLite"):
-    st.warning(f"Database: {backend}. Start PostgreSQL and run `python load_data.py`.")
+    st.sidebar.info("Demo mode: the reviewed backlog is loaded from the CSV into an "
+                    "in-memory SQL database (PostgreSQL not configured).")
 else:
     st.sidebar.success(f"Connected to {backend}")
 st.sidebar.markdown("**Backlog**")
