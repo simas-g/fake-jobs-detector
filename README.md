@@ -16,9 +16,11 @@ python -m venv --system-site-packages .venv
 export PGHOST=localhost PGPORT=5433 PGDATABASE=fakejobs PGUSER=$USER   # PGPASSWORD=... if needed
 
 .venv/bin/python load_data.py      # create database + schema, import data/fake_jobs.csv
-.venv/bin/python evaluate.py       # model selection + test-set results -> results/metrics.json
+.venv/bin/python evaluate.py       # model selection + test results -> results/metrics.json, saves model/knn.pkl
 .venv/bin/python -m streamlit run app.py     # http://localhost:8501
 ```
+
+The app reads the `posting` and `category` tables into pandas once and runs every query on them with **pandasql**, including the filters in "Explore the backlog" and a free SQL box.
 
 If PostgreSQL can't be reached, the app builds the same schema in an in-memory SQLite database from the CSV and shows a warning, so the demo still works.
 
@@ -29,10 +31,11 @@ If PostgreSQL can't be reached, the app builds the same schema in an in-memory S
 | `sql/schema.sql` | Normalised schema: `category` (8 rows) and `posting` (400 rows), with CHECK constraints for flags, hours and the salary pair |
 | `sql/queries.sql` | Every backlog query the app shows, as named blocks |
 | `load_data.py` | Creates the database and imports the CSV (empty salaries become `NULL`) |
-| `db.py` | Connection (PostgreSQL, SQLite fallback), query loader |
+| `db.py` | Connection (PostgreSQL, SQLite fallback), query loader, `sqldf()`: runs SQL on the DataFrames with pandasql |
 | `features.py` | `prepare()`: the cleaning and feature engineering, used for both the backlog and new postings |
 | `knn.py` | KNN written from scratch with numpy: standardization, Euclidean distance, majority vote |
-| `evaluate.py` | Hold-out test set, 5-fold CV for scaling / features / k, check against scikit-learn |
+| `evaluate.py` | Hold-out test set, 5-fold CV for scaling / features / k, check against scikit-learn; trains the final model once and saves it |
+| `model/knn.pkl` | The saved, trained model the app loads |
 | `app.py` | Streamlit app |
 
 ## Data cleaning and features

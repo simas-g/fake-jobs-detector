@@ -1,5 +1,7 @@
 -- Backlog queries shown in the app. Each block starts with "-- name: <key>"
 -- and a "-- title:" line; db.py splits the file on those markers.
+-- The app runs them with pandasql on DataFrames read from the database
+-- (SQLite dialect), so they must stay valid in both SQLite and PostgreSQL.
 -- Rates use AVG(scam * 1.0) so integer division never truncates them.
 
 -- name: overview
@@ -99,6 +101,21 @@ SELECT 'remote job', SUM(is_remote),
        AVG(CASE WHEN is_remote = 1 THEN scam * 1.0 END),
        AVG(CASE WHEN is_remote = 0 THEN scam * 1.0 END)
 FROM posting;
+
+-- name: rate_by_company_size
+-- title: Scam rate by claimed company size
+SELECT CASE
+           WHEN company_size < 10  THEN '1 under 10 employees'
+           WHEN company_size < 50  THEN '2 10 to 49'
+           WHEN company_size < 250 THEN '3 50 to 249'
+           ELSE                         '4 250 or more'
+       END                     AS company_size,
+       COUNT(*)                AS postings,
+       SUM(scam)               AS scams,
+       AVG(scam * 1.0)         AS scam_rate
+FROM posting
+GROUP BY 1
+ORDER BY 1;
 
 -- name: largest_claimed_scam_company
 -- title: Largest company size claimed by a confirmed scam vs legitimate posting

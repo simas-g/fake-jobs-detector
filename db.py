@@ -14,6 +14,8 @@ ROOT = Path(__file__).parent
 CSV_PATH = ROOT / "data" / "fake_jobs.csv"
 SCHEMA_PATH = ROOT / "sql" / "schema.sql"
 QUERIES_PATH = ROOT / "sql" / "queries.sql"
+MODEL_PATH = ROOT / "model" / "knn.pkl"
+TABLES = ("category", "posting")
 
 POSTING_COLUMNS = [
     "salary_min", "salary_max", "required_experience_years", "skills_listed",
@@ -110,3 +112,14 @@ def run_query(conn, sql):
             if converted.notna().sum() == df[c].notna().sum():
                 df[c] = converted
     return df
+
+
+def load_tables(conn):
+    """Read every table from the database into pandas DataFrames, once."""
+    return {t: run_query(conn, f"SELECT * FROM {t} ORDER BY 1") for t in TABLES}
+
+
+def sqldf(sql, tables):
+    """Run SQL on the pandas DataFrames with pandasql (SQLite dialect)."""
+    from pandasql import sqldf as _sqldf
+    return _sqldf(sql, dict(tables))

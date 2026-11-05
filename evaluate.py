@@ -5,10 +5,14 @@
    5-fold cross-validation.
 3. Train the chosen setup on the full 80% and report it once on the test set.
 
+4. Train the final model once on all 400 reviewed postings and save it to
+   model/knn.pkl; the app loads that file instead of training.
+
 Writes results/metrics.json, which the app's "Model performance" tab reads.
 Usage:  python evaluate.py
 """
 import json
+import pickle
 
 import numpy as np
 from sklearn.model_selection import StratifiedKFold, train_test_split
@@ -125,6 +129,16 @@ def main():
     db.ROOT.joinpath("results").mkdir(exist_ok=True)
     (db.ROOT / "results" / "metrics.json").write_text(json.dumps(results, indent=2, default=float))
     print("\nwrote results/metrics.json")
+
+    # the model the app uses: same setup, trained once on the whole backlog so
+    # every reviewed posting can be shown as a neighbour
+    final = KNN(3, "standard").fit(feats[FEATURES].to_numpy(dtype=float), y)
+    db.MODEL_PATH.parent.mkdir(exist_ok=True)
+    db.MODEL_PATH.write_bytes(pickle.dumps({
+        "model": final, "features": FEATURES,
+        "posting_ids": df["posting_id"].astype(int).tolist(),
+    }))
+    print(f"saved the trained model to {db.MODEL_PATH.relative_to(db.ROOT)}")
 
 
 if __name__ == "__main__":

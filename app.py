@@ -3,6 +3,7 @@
 Run:  streamlit run app.py
 """
 import json
+import pickle
 
 import altair as alt
 import pandas as pd
@@ -52,19 +53,34 @@ def get_connection():
     return db.connect()
 
 
-@st.cache_data
-def query(name):
+@st.cache_resource
+def get_tables():
+    """Read the tables from the database once; every query then runs on these DataFrames."""
     conn, _ = get_connection()
+    return db.load_tables(conn)
+
+
+@st.cache_data
+def run_sql(sql):
+    return db.sqldf(sql, get_tables())
+
+
+def query(name):
     q = db.load_queries()[name]
-    return q["title"], q["sql"], db.run_query(conn, q["sql"])
+    return q["title"], q["sql"], run_sql(q["sql"])
 
 
 @st.cache_resource
 def get_model():
-    """Fit on the whole reviewed backlog: every stored posting can be a neighbour."""
+    """Load the KNN model saved by evaluate.py (trained once on the whole backlog)."""
+    if not db.MODEL_PATH.exists():
+        st.error("No saved model found. Run `python evaluate.py` to train and save it.")
+        st.stop()
+    saved = pickle.loads(db.MODEL_PATH.read_bytes())
     _, _, backlog = query("all_postings")
-    model = KNN(k=3, scaling="standard").fit(prepare(backlog), backlog["scam"])
-    return model, backlog
+    # row i of the model's training matrix is posting saved["posting_ids"][i]
+    backlog = backlog.set_index("posting_id").loc[saved["posting_ids"]].reset_index()
+    return saved["model"], backlog
 
 
 def pct(x):
@@ -222,7 +238,9 @@ with tab_check:
 
 # ---------------------------------------------------------------- backlog insights
 with tab_backlog:
-    st.markdown("Every table below is a live SQL query against the moderation backlog.")
+    st.markdown("The backlog is read from the database once; every table below is a SQL "
+                "query run on those pandas DataFrames with pandasql. Open “SQL” under a "
+                "table to see the query.")
     _, _, ov = query("overview")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Reviewed postings", int(ov.postings[0]))
@@ -240,11 +258,75 @@ with tab_backlog:
     with left:
         show_query("rate_by_posting_time", rate_bars("time_of_day"))
         show_query("rate_by_experience", rate_bars("experience"))
-        show_query("largest_claimed_scam_company")
+        show_query("rate_by_company_size", rate_bars("company_size"))
     with right:
         show_query("rate_by_salary_width", rate_bars("salary_range"))
         show_query("rate_by_category", rate_bars("category"))
         show_query("rate_by_flag")
+        show_query("largest_claimed_scam_company")
+
+    st.divider()
+    st.subheader("Explore the backlog")
+    st.markdown("Pick filters; the app writes the SQL and runs it with pandasql.")
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
+    cats = c1.multiselect("Category", CATEGORIES, default=CATEGORIES)
+    outcome = c2.selectbox("Outcome", ["all", "scam", "legitimate"])
+    pay = c3.selectbox("Pay range", ["all", "published", "not published"])
+    hours = c4.slider("Hour the listing went live", 0, 23, (0, 23))
+    c1, c2 = st.columns(2)
+    min_vague = c1.slider("At least this many vague words", 0, 10, 0)
+    max_exp = c2.slider("At most this many years of experience required", 0.0, 15.0, 15.0, 0.5)
+
+    if not cats:
+        st.info("Select at least one category.")
+    else:
+        where = [f"c.name IN ({', '.join(repr(c) for c in cats)})",
+                 f"p.posting_hour BETWEEN {hours[0]} AND {hours[1]}",
+                 f"p.vague_word_count >= {min_vague}",
+                 f"p.required_experience_years <= {max_exp}"]
+        if outcome != "all":
+            where.append(f"p.scam = {int(outcome == 'scam')}")
+        if pay != "all":
+            where.append(f"p.salary_min IS {'NOT ' if pay == 'published' else ''}NULL")
+        explore_sql = (
+            "SELECT p.posting_id, c.name AS category, p.salary_min, p.salary_max,\n"
+            "       ROUND(p.salary_max * 1.0 / p.salary_min, 2) AS salary_width,\n"
+            "       p.required_experience_years, p.skills_listed, p.vague_word_count,\n"
+            "       p.posting_hour, p.company_size,\n"
+            "       CASE WHEN p.scam = 1 THEN 'scam' ELSE 'legitimate' END AS outcome\n"
+            "FROM posting p\nJOIN category c ON c.category_id = p.category_id\n"
+            "WHERE " + "\n  AND ".join(where) + "\nORDER BY p.posting_id")
+        found = run_sql(explore_sql)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Matching postings", len(found))
+        n_scam = int((found.outcome == "scam").sum())
+        c2.metric("Of which scams", n_scam)
+        c3.metric("Scam rate", pct(n_scam / len(found)) if len(found) else "–")
+        if len(found):
+            st.altair_chart(
+                alt.Chart(found).mark_bar().encode(
+                    x=alt.X("posting_hour:O", title="hour the listing went live"),
+                    y=alt.Y("count():Q", title="postings"),
+                    color=alt.Color("outcome:N", title=None, scale=alt.Scale(
+                        domain=["legitimate", "scam"], range=[LEGIT_COLOR, SCAM_COLOR])),
+                    tooltip=["posting_hour", "outcome", "count()"]),
+                width="stretch")
+            st.dataframe(found, hide_index=True, width="stretch")
+        with st.expander("SQL"):
+            st.code(explore_sql, language="sql")
+
+    with st.expander("Write your own query"):
+        st.markdown("Tables: `posting` and `category` (join on `category_id`). "
+                    "SQLite syntax, runs with pandasql on a copy of the data.")
+        own = st.text_area("SQL", "SELECT c.name AS category, COUNT(*) AS postings, "
+                           "AVG(p.scam * 1.0) AS scam_rate\nFROM posting p JOIN category c "
+                           "ON c.category_id = p.category_id\nGROUP BY c.name ORDER BY scam_rate DESC")
+        if st.button("Run query"):
+            try:
+                st.dataframe(run_sql(own), hide_index=True, width="stretch")
+            except Exception as e:
+                st.error(f"Query failed: {e}")
 
 # ---------------------------------------------------------------- model performance
 with tab_model:
