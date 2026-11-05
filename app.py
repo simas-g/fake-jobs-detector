@@ -1,373 +1,230 @@
-"""Fake Jobs Detector: Streamlit app for the trust and safety team.
-
-Run:  streamlit run app.py
-"""
+"""Fake Jobs Detector.  Run:  streamlit run app.py"""
 import json
 import pickle
 
-import altair as alt
 import pandas as pd
 import streamlit as st
 
 import db
-from features import CATEGORIES, FEATURES, prepare
-from knn import KNN
+from features import prepare
 
-st.set_page_config(page_title="Fake Jobs Detector", page_icon="🔎", layout="wide")
-
-SCAM_COLOR, LEGIT_COLOR = "#C2571A", "#2B5F9E"
-
-EXAMPLES = {
-    "Example: likely scam": dict(
-        has_salary=True, salary_min=2500, salary_max=7500, required_experience_years=0.5,
-        skills_listed=6, vague_word_count=5, exclamation_marks=3, allcaps_ratio=0.09,
-        posting_hour=3, employer_response_delay_h=4.0, is_remote=True, free_mail_contact=True,
-        company_age_months=12, company_size=4, category="finance", mentions_trial_or_payment=True),
-    "Example: likely legitimate": dict(
-        has_salary=True, salary_min=4800, salary_max=5900, required_experience_years=6.0,
-        skills_listed=18, vague_word_count=2, exclamation_marks=1, allcaps_ratio=0.015,
-        posting_hour=14, employer_response_delay_h=15.0, is_remote=False, free_mail_contact=False,
-        company_age_months=60, company_size=25, category="sales", mentions_trial_or_payment=False),
-    # borderline: 2 of 3 neighbours are scams; moving the hour to 21 flips the vote
-    "Example: borderline, no pay range": dict(
-        has_salary=False, salary_min=4000, salary_max=5000, required_experience_years=1.6,
-        skills_listed=9, vague_word_count=3, exclamation_marks=2, allcaps_ratio=0.02,
-        posting_hour=22, employer_response_delay_h=6.0, is_remote=True, free_mail_contact=False,
-        company_age_months=20, company_size=8, category="marketing", mentions_trial_or_payment=False),
-}
-
-FEATURE_LABELS = {
-    "salary_width": "salary width (max ÷ min)",
-    "no_salary": "no pay range",
-    "required_experience_years": "experience (years)",
-    "skills_listed": "skills listed",
-    "allcaps_ratio": "capitals ratio",
-    "hour_sin": "posting hour (sin)",
-    "hour_cos": "posting hour (cos)",
-    "vague_word_count": "vague words",
-}
-
-
-@st.cache_resource
-def get_connection():
-    return db.connect()
-
-
-@st.cache_resource
-def get_tables():
-    """Read the tables from the database once; every query then runs on these DataFrames."""
-    conn, _ = get_connection()
-    return db.load_tables(conn)
+st.set_page_config(page_title="Fake Jobs Detector", layout="wide")
 
 
 @st.cache_data
-def run_sql(sql):
-    return db.sqldf(sql, get_tables())
+def load_tables():
+    return db.load_tables()
 
 
-def query(name):
-    q = db.load_queries()[name]
-    return q["title"], q["sql"], run_sql(q["sql"])
+posting, category, source = load_tables()
 
 
-@st.cache_resource
-def get_model():
-    """Load the KNN model saved by evaluate.py (trained once on the whole backlog)."""
-    if not db.MODEL_PATH.exists():
-        st.error("No saved model found. Run `python evaluate.py` to train and save it.")
-        st.stop()
-    saved = pickle.loads(db.MODEL_PATH.read_bytes())
-    _, _, backlog = query("all_postings")
-    # row i of the model's training matrix is posting saved["posting_ids"][i]
-    backlog = backlog.set_index("posting_id").loc[saved["posting_ids"]].reset_index()
-    return saved["model"], backlog
+@st.cache_data
+def sql(query):
+    return db.run(query, posting, category)
 
 
-def pct(x):
-    return f"{x:.0%}" if pd.notna(x) else "–"
+backlog = sql(db.ALL_POSTINGS)
+model = pickle.load(open("model/knn.pkl", "rb"))  # trained by evaluate.py
+metrics = json.load(open("results/metrics.json"))
 
+st.sidebar.metric("Reviewed postings", len(posting))
+st.sidebar.metric("Confirmed scams", int(posting["scam"].sum()))
+st.sidebar.caption(f"Data: {source}")
 
-def show_query(name, chart=None):
-    title, sql, df = query(name)
-    st.subheader(title)
-    if chart is not None:
-        st.altair_chart(chart(df), width="stretch")
-    shown = df.copy()
-    for c in shown.columns:
-        if "rate" in c:
-            shown[c] = shown[c].map(pct)
-    st.dataframe(shown, hide_index=True, width="stretch")
-    with st.expander("SQL"):
-        st.code(sql, language="sql")
+st.title("Fake Jobs Detector")
+st.caption("For the trust and safety team: which traits go with scams, and a verdict for a new "
+           "posting based on the 3 most similar postings we already reviewed.")
 
+tab_check, tab_backlog, tab_model = st.tabs(["Check a posting", "Backlog insights", "Model performance"])
 
-def rate_bars(label_col):
-    def chart(df):
-        d = df.copy()
-        d[label_col] = d[label_col].astype(str).str.replace(r"^\d ", "", regex=True)
-        return (
-            alt.Chart(d)
-            .mark_bar(color=SCAM_COLOR, cornerRadiusEnd=3)
-            .encode(
-                x=alt.X("scam_rate:Q", title="scam rate", axis=alt.Axis(format="%"),
-                        scale=alt.Scale(domain=[0, 1])),
-                y=alt.Y(f"{label_col}:N", sort=None, title=None),
-                tooltip=[label_col, "postings", "scams",
-                         alt.Tooltip("scam_rate:Q", format=".0%")],
-            )
-            .properties(height=36 * len(d) + 20)
-        )
-    return chart
-
-
-# ---------------------------------------------------------------- layout
-conn, backend = get_connection()
-st.title("🔎 Fake Jobs Detector")
-st.caption("Moderation support for the trust and safety team: which listing traits go with "
-           "confirmed scams, and a verdict for new postings, explained by the 3 most similar "
-           "reviewed postings.")
-st.sidebar.caption("Data: PostgreSQL" if backend == "PostgreSQL" else "Data: CSV (no database connection)")
-st.sidebar.markdown("**Backlog**")
-_, _, ov = query("overview")
-st.sidebar.metric("Reviewed postings", int(ov.postings[0]))
-st.sidebar.metric("Confirmed scams", f"{int(ov.confirmed_scams[0])} ({pct(ov.scam_rate[0])})")
-
-tab_check, tab_backlog, tab_model = st.tabs(
-    ["Check a posting", "Backlog insights", "Model performance"])
-
-# ---------------------------------------------------------------- check a posting
+# ------------------------------------------------------------------ check a posting
 with tab_check:
-    model, backlog = get_model()
-
-    cols = st.columns(len(EXAMPLES) + 1)
-    for col, name in zip(cols, EXAMPLES):
-        if col.button(name, width="stretch"):
-            for key, value in EXAMPLES[name].items():
-                st.session_state[key] = value
-    if cols[-1].button("Clear", width="stretch"):
-        for key in EXAMPLES[next(iter(EXAMPLES))]:
-            st.session_state.pop(key, None)
-
-    defaults = EXAMPLES["Example: likely legitimate"]
-    for key, value in defaults.items():
-        st.session_state.setdefault(key, value)
-
     with st.form("posting"):
-        st.markdown("**Pay**")
-        c1, c2, c3 = st.columns([1, 1, 1])
-        has_salary = c1.checkbox("Pay range published", key="has_salary")
-        salary_min = c2.number_input("Minimum salary (€/month)", 0, 50000, step=100, key="salary_min")
-        salary_max = c3.number_input("Maximum salary (€/month)", 0, 50000, step=100, key="salary_max")
+        c1, c2, c3 = st.columns(3)
+        has_salary = c1.checkbox("Pay range published", value=True)
+        salary_min = c2.number_input("Minimum salary (€/month)", 0, 50000, 2500, step=100)
+        salary_max = c3.number_input("Maximum salary (€/month)", 0, 50000, 7500, step=100)
 
-        st.markdown("**Text of the posting**")
         c1, c2, c3, c4 = st.columns(4)
-        exp = c1.number_input("Experience required (years)", 0.0, 40.0, step=0.5, key="required_experience_years")
-        skills = c2.number_input("Skills listed", 0, 100, key="skills_listed")
-        vague = c3.number_input("Vague words (rockstar, ninja…)", 0, 50, key="vague_word_count")
-        excl = c4.number_input("Exclamation marks", 0, 50, key="exclamation_marks")
-        c1, c2, c3, _ = st.columns(4)
-        caps = c1.number_input("Share of capitals (0–1)", 0.0, 1.0, step=0.005, format="%.3f", key="allcaps_ratio")
-        hour = c2.slider("Hour the listing went live", 0, 23, key="posting_hour")
-        trial = c3.checkbox("Asks for trial fee / deposit / payment details", key="mentions_trial_or_payment")
+        experience = c1.number_input("Experience required (years)", 0.0, 40.0, 0.5, step=0.5)
+        skills = c2.number_input("Skills listed", 0, 100, 6)
+        vague = c3.number_input("Vague words (rockstar, ninja...)", 0, 50, 5)
+        caps = c4.number_input("Share of capital letters (0-1)", 0.0, 1.0, 0.09, step=0.01)
 
-        st.markdown("**Employer and company**")
-        c1, c2, c3, c4 = st.columns(4)
-        delay = c1.number_input("Response delay (hours)", 0.0, 1000.0, step=0.5, key="employer_response_delay_h")
-        age = c2.number_input("Company age on the board (months)", 0, 1000, key="company_age_months")
-        size = c3.number_input("Claimed company size", 1, 100000, key="company_size")
-        category = c4.selectbox("Category", CATEGORIES, key="category")
-        c1, c2, _, _ = st.columns(4)
-        remote = c1.checkbox("Remote job", key="is_remote")
-        freemail = c2.checkbox("Contact via gmail / hotmail", key="free_mail_contact")
-
-        submitted = st.form_submit_button("Check posting", type="primary")
+        hour = st.slider("Hour the posting went live", 0, 23, 3)
+        submitted = st.form_submit_button("Check posting")
 
     if submitted:
-        if has_salary and salary_min > salary_max:
-            st.error("Minimum salary is above the maximum salary.")
+        if has_salary and not 0 < salary_min <= salary_max:
+            st.error("The minimum salary must be above 0 and not higher than the maximum.")
             st.stop()
-        if has_salary and salary_min == 0:
-            st.error("Enter a minimum salary above 0, or untick “Pay range published”.")
-            st.stop()
+
         new = pd.DataFrame([{
-            "salary_min": salary_min if has_salary else None,
-            "salary_max": salary_max if has_salary else None,
-            "required_experience_years": exp, "skills_listed": skills,
-            "vague_word_count": vague, "exclamation_marks": excl, "allcaps_ratio": caps,
-            "posting_hour": hour, "employer_response_delay_h": delay,
-            "is_remote": int(remote), "free_mail_contact": int(freemail),
-            "company_age_months": age, "company_size": size, "category": category,
-            "mentions_trial_or_payment": int(trial),
+            "salary_min": salary_min if has_salary else float("nan"),
+            "salary_max": salary_max if has_salary else float("nan"),
+            "required_experience_years": experience,
+            "skills_listed": skills,
+            "vague_word_count": vague,
+            "allcaps_ratio": caps,
+            "posting_hour": hour,
         }])
-        X_new = prepare(new)
-        idx, dist = model.kneighbors(X_new)
-        votes = int(backlog["scam"].iloc[idx[0]].sum())
-        is_scam = votes >= 2
 
-        if is_scam:
-            st.error(f"### Verdict: likely SCAM\n{votes} of the 3 most similar reviewed postings were confirmed scams.")
+        rows, distances = model.kneighbors(prepare(new))
+        nearest = backlog.iloc[rows[0]].copy()
+        nearest.insert(1, "distance", distances[0].round(2))
+        scams = int(nearest["scam"].sum())
+
+        if scams >= 2:
+            st.error(f"**Likely a SCAM**: {scams} of the 3 most similar reviewed postings were scams.")
         else:
-            st.success(f"### Verdict: likely LEGITIMATE\n{3 - votes} of the 3 most similar reviewed postings were legitimate.")
-        st.caption("Advisory only: a moderator makes the final decision.")
+            st.success(f"**Likely legitimate**: {3 - scams} of the 3 most similar reviewed postings were legitimate.")
+        st.caption("This is advice only. A moderator makes the final decision.")
 
-        st.subheader("The 3 closest reviewed postings")
-        neighbours = backlog.iloc[idx[0]].copy()
-        neighbours.insert(0, "distance", dist[0].round(2))
-        neighbours.insert(1, "outcome", neighbours.pop("scam").map({1: "🚩 scam", 0: "✅ legitimate"}))
-        show_cols = ["posting_id", "distance", "outcome", "salary_min", "salary_max",
-                     "required_experience_years", "skills_listed", "allcaps_ratio",
-                     "posting_hour", "vague_word_count", "company_size", "category",
-                     "mentions_trial_or_payment"]
-        compare = pd.concat([new.assign(posting_id="new", distance=0.0, outcome="?"),
-                             neighbours.assign(posting_id=neighbours.posting_id.astype(str))])
-        st.dataframe(compare[show_cols], hide_index=True, width="stretch")
+        st.write("The 3 most similar reviewed postings:")
+        st.dataframe(nearest[["posting_id", "distance", "scam", "salary_min", "salary_max",
+                              "required_experience_years", "skills_listed", "vague_word_count",
+                              "allcaps_ratio", "posting_hour", "category"]], hide_index=True)
 
-        with st.expander("How the distance is computed"):
-            st.markdown(
-                "Each posting is turned into 8 numbers: " +
-                ", ".join(FEATURE_LABELS[f] for f in FEATURES) +
-                ". Every number is standardized (minus the backlog mean, divided by the "
-                "standard deviation) so no feature dominates, and the Euclidean distance to "
-                "every reviewed posting is computed. The 3 closest vote.")
-            z = pd.DataFrame(model._scale(X_new), columns=[FEATURE_LABELS[f] for f in FEATURES])
-            st.dataframe(z.round(2), hide_index=True, width="stretch")
+# ------------------------------------------------------------------ backlog insights
+QUERIES = {
+    "Scam rate by time of day": """
+        SELECT CASE WHEN posting_hour < 6  THEN '1 night (00-05)'
+                    WHEN posting_hour < 12 THEN '2 morning (06-11)'
+                    WHEN posting_hour < 18 THEN '3 afternoon (12-17)'
+                    ELSE '4 evening (18-23)' END AS time_of_day,
+               COUNT(*) AS postings, SUM(scam) AS scams, AVG(scam) AS scam_rate
+        FROM posting
+        GROUP BY time_of_day""",
+    "Scam rate by pay range width (max / min)": """
+        SELECT CASE WHEN salary_min IS NULL THEN '0 no pay range'
+                    WHEN salary_max * 1.0 / salary_min <= 1.2 THEN '1 up to 1.2x'
+                    WHEN salary_max * 1.0 / salary_min <= 1.4 THEN '2 1.2x to 1.4x'
+                    ELSE '3 more than 1.4x' END AS pay_range,
+               COUNT(*) AS postings, SUM(scam) AS scams, AVG(scam) AS scam_rate
+        FROM posting
+        GROUP BY pay_range""",
+    "Scam rate by experience required": """
+        SELECT CASE WHEN required_experience_years < 2 THEN '1 under 2 years'
+                    WHEN required_experience_years < 5 THEN '2 2 to 5 years'
+                    ELSE '3 5 years or more' END AS experience,
+               COUNT(*) AS postings, SUM(scam) AS scams, AVG(scam) AS scam_rate
+        FROM posting
+        GROUP BY experience""",
+    "Scam rate by claimed company size": """
+        SELECT CASE WHEN company_size < 10 THEN '1 under 10'
+                    WHEN company_size < 50 THEN '2 10 to 49'
+                    ELSE '3 50 or more' END AS claimed_size,
+               COUNT(*) AS postings, SUM(scam) AS scams, AVG(scam) AS scam_rate
+        FROM posting
+        GROUP BY claimed_size""",
+    "Scam rate per job category": """
+        SELECT c.name AS category, COUNT(*) AS postings, SUM(p.scam) AS scams, AVG(p.scam) AS scam_rate
+        FROM posting p
+        JOIN category c ON c.category_id = p.category_id
+        GROUP BY c.name
+        ORDER BY scam_rate DESC""",
+}
 
-# ---------------------------------------------------------------- backlog insights
 with tab_backlog:
-    st.markdown("The backlog is read from the database once; every table below is a SQL "
-                "query run on those pandas DataFrames with pandasql. Open “SQL” under a "
-                "table to see the query.")
-    _, _, ov = query("overview")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Reviewed postings", int(ov.postings[0]))
-    c2.metric("Confirmed scams", int(ov.confirmed_scams[0]))
-    c3.metric("Scam rate", pct(ov.scam_rate[0]))
-    c4.metric("Without a pay range", int(ov.without_salary[0]))
+    st.write("Every table on this page is a SQL query run with pandasql.")
 
-    title, sql, prof = query("profile_by_outcome")
-    st.subheader(title)
-    st.dataframe(prof.set_index("outcome").T.round(3), width="stretch")
-    with st.expander("SQL"):
-        st.code(sql, language="sql")
+    st.subheader("Average traits: legitimate vs scam")
+    averages = sql("""
+        SELECT scam, COUNT(*) AS postings,
+               AVG(required_experience_years) AS experience_years,
+               AVG(skills_listed) AS skills_listed,
+               AVG(vague_word_count) AS vague_words,
+               AVG(allcaps_ratio) AS allcaps_ratio,
+               AVG(company_size) AS company_size,
+               AVG(salary_max * 1.0 / salary_min) AS pay_range_width,
+               SUM(salary_min IS NULL) AS without_pay_range
+        FROM posting
+        GROUP BY scam""")
+    st.dataframe(averages.round(3), hide_index=True)
 
-    left, right = st.columns(2)
-    with left:
-        show_query("rate_by_posting_time", rate_bars("time_of_day"))
-        show_query("rate_by_experience", rate_bars("experience"))
-        show_query("rate_by_company_size", rate_bars("company_size"))
-    with right:
-        show_query("rate_by_salary_width", rate_bars("salary_range"))
-        show_query("rate_by_category", rate_bars("category"))
-        show_query("rate_by_flag")
-        show_query("largest_claimed_scam_company")
+    for title, query in QUERIES.items():
+        st.subheader(title)
+        result = sql(query)
+        left, right = st.columns(2)
+        left.dataframe(result.round(2), hide_index=True)
+        right.bar_chart(result, x=result.columns[0], y="scam_rate", horizontal=True, height=60 + 35 * len(result))
+        with st.expander("SQL"):
+            st.code(query, language="sql")
 
-    st.divider()
-    st.subheader("Explore the backlog")
-    st.markdown("Pick filters; the app writes the SQL and runs it with pandasql.")
-    c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
-    cats = c1.multiselect("Category", CATEGORIES, default=CATEGORIES)
+    st.header("Explore the backlog")
+    c1, c2, c3 = st.columns(3)
+    categories = c1.multiselect("Category", category["name"], default=list(category["name"]))
     outcome = c2.selectbox("Outcome", ["all", "scam", "legitimate"])
     pay = c3.selectbox("Pay range", ["all", "published", "not published"])
-    hours = c4.slider("Hour the listing went live", 0, 23, (0, 23))
-    c1, c2 = st.columns(2)
-    min_vague = c1.slider("At least this many vague words", 0, 10, 0)
-    max_exp = c2.slider("At most this many years of experience required", 0.0, 15.0, 15.0, 0.5)
+    hours = st.slider("Hour the posting went live", 0, 23, (0, 23), key="explore_hours")
 
-    if not cats:
-        st.info("Select at least one category.")
+    if not categories:
+        st.info("Pick at least one category.")
     else:
-        where = [f"c.name IN ({', '.join(repr(c) for c in cats)})",
-                 f"p.posting_hour BETWEEN {hours[0]} AND {hours[1]}",
-                 f"p.vague_word_count >= {min_vague}",
-                 f"p.required_experience_years <= {max_exp}"]
-        if outcome != "all":
-            where.append(f"p.scam = {int(outcome == 'scam')}")
-        if pay != "all":
-            where.append(f"p.salary_min IS {'NOT ' if pay == 'published' else ''}NULL")
-        explore_sql = (
-            "SELECT p.posting_id, c.name AS category, p.salary_min, p.salary_max,\n"
-            "       ROUND(p.salary_max * 1.0 / p.salary_min, 2) AS salary_width,\n"
-            "       p.required_experience_years, p.skills_listed, p.vague_word_count,\n"
-            "       p.posting_hour, p.company_size,\n"
-            "       CASE WHEN p.scam = 1 THEN 'scam' ELSE 'legitimate' END AS outcome\n"
-            "FROM posting p\nJOIN category c ON c.category_id = p.category_id\n"
-            "WHERE " + "\n  AND ".join(where) + "\nORDER BY p.posting_id")
-        found = run_sql(explore_sql)
+        names = ", ".join(f"'{name}'" for name in categories)
+        query = f"""
+        SELECT p.posting_id, c.name AS category, p.salary_min, p.salary_max,
+               p.required_experience_years, p.posting_hour, p.scam
+        FROM posting p
+        JOIN category c ON c.category_id = p.category_id
+        WHERE c.name IN ({names})
+          AND p.posting_hour BETWEEN {hours[0]} AND {hours[1]}"""
+        if outcome == "scam":
+            query += "\n          AND p.scam = 1"
+        if outcome == "legitimate":
+            query += "\n          AND p.scam = 0"
+        if pay == "published":
+            query += "\n          AND p.salary_min IS NOT NULL"
+        if pay == "not published":
+            query += "\n          AND p.salary_min IS NULL"
 
-        c1, c2, c3 = st.columns(3)
+        found = sql(query)
+        c1, c2 = st.columns(2)
         c1.metric("Matching postings", len(found))
-        n_scam = int((found.outcome == "scam").sum())
-        c2.metric("Of which scams", n_scam)
-        c3.metric("Scam rate", pct(n_scam / len(found)) if len(found) else "–")
-        if len(found):
-            st.altair_chart(
-                alt.Chart(found).mark_bar().encode(
-                    x=alt.X("posting_hour:O", title="hour the listing went live"),
-                    y=alt.Y("count():Q", title="postings"),
-                    color=alt.Color("outcome:N", title=None, scale=alt.Scale(
-                        domain=["legitimate", "scam"], range=[LEGIT_COLOR, SCAM_COLOR])),
-                    tooltip=["posting_hour", "outcome", "count()"]),
-                width="stretch")
-            st.dataframe(found, hide_index=True, width="stretch")
+        c2.metric("Of which scams", int(found["scam"].sum()))
+        found["outcome"] = found["scam"].map({0: "legitimate", 1: "scam"})
+        st.bar_chart(found.groupby(["posting_hour", "outcome"]).size().unstack(fill_value=0))
+        st.dataframe(found, hide_index=True)
         with st.expander("SQL"):
-            st.code(explore_sql, language="sql")
+            st.code(query, language="sql")
 
-    with st.expander("Write your own query"):
-        st.markdown("Tables: `posting` and `category` (join on `category_id`). "
-                    "SQLite syntax, runs with pandasql on a copy of the data.")
-        own = st.text_area("SQL", "SELECT c.name AS category, COUNT(*) AS postings, "
-                           "AVG(p.scam * 1.0) AS scam_rate\nFROM posting p JOIN category c "
-                           "ON c.category_id = p.category_id\nGROUP BY c.name ORDER BY scam_rate DESC")
-        if st.button("Run query"):
+    with st.expander("Write your own query (tables: posting, category)"):
+        own = st.text_area("SQL", "SELECT category_id, COUNT(*) AS postings FROM posting GROUP BY category_id")
+        if st.button("Run"):
             try:
-                st.dataframe(run_sql(own), hide_index=True, width="stretch")
-            except Exception as e:
-                st.error(f"Query failed: {e}")
+                st.dataframe(sql(own), hide_index=True)
+            except Exception as error:
+                st.error(error)
 
-# ---------------------------------------------------------------- model performance
+# ------------------------------------------------------------------ model performance
 with tab_model:
-    path = db.ROOT / "results" / "metrics.json"
-    if not path.exists():
-        st.info("Run `python evaluate.py` to generate the evaluation results.")
-    else:
-        r = json.loads(path.read_text())
-        t, base = r["test"], r["baseline_always_legit"]
-        st.markdown(f"**3-nearest neighbours**, Euclidean distance on 8 standardized features. "
-                    f"Chosen with 5-fold cross-validation on {r['n_train']} postings, "
-                    f"then tested once on {r['n_test']} held-out postings.")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Precision", pct(t["precision"]), help="Of the postings flagged as scam, the share that really are")
-        c2.metric("Recall", pct(t["recall"]), help="Of all scams, the share we catch")
-        c3.metric("Accuracy", pct(t["accuracy"]))
-        c4.metric("Baseline accuracy", pct(base["accuracy"]), help="Always answering “legitimate”")
+    test, baseline = metrics["test"], metrics["baseline"]
+    st.write(f"3 nearest neighbours, Euclidean distance on 8 standardized features. Chosen with "
+             f"5-fold cross-validation on {metrics['n_train']} postings, tested once on "
+             f"{metrics['n_test']} postings the model never saw.")
 
-        st.subheader("Confusion matrix (test set)")
-        cm = pd.DataFrame(
-            [[t["tn"], t["fp"]], [t["fn"], t["tp"]]],
-            index=["actually legitimate", "actually scam"],
-            columns=["predicted legitimate", "predicted scam"])
-        st.dataframe(cm, width="stretch")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Accuracy", f"{test['accuracy']:.1%}")
+    c2.metric("Precision", f"{test['precision']:.1%}")
+    c3.metric("Recall", f"{test['recall']:.1%}")
+    c4.metric("Baseline accuracy (always legitimate)", f"{baseline['accuracy']:.1%}")
 
-        def cv_table(section):
-            return pd.DataFrame(r[section]).T[["accuracy", "precision", "recall"]].astype(float)
+    st.subheader("Confusion matrix (test set)")
+    st.dataframe(pd.DataFrame(
+        [[test["tn"], test["fp"]], [test["fn"], test["tp"]]],
+        index=["actually legitimate", "actually scam"],
+        columns=["predicted legitimate", "predicted scam"]))
 
-        left, right = st.columns(2)
-        with left:
-            st.subheader("Feature sets (CV, k = 3)")
-            st.dataframe(cv_table("feature_sets").map(pct), width="stretch")
-            st.subheader("Scaling (CV, all raw columns)")
-            st.dataframe(cv_table("scaling").map(pct), width="stretch")
-        with right:
-            st.subheader("Choice of k (CV)")
-            kv = cv_table("k_values").reset_index(names="k").melt("k", var_name="metric")
-            kv["k"] = kv["k"].astype(int)  # sort 1, 3, 5 ... 15, not as text
-            st.altair_chart(
-                alt.Chart(kv).mark_line(point=True).encode(
-                    x=alt.X("k:O"), y=alt.Y("value:Q", scale=alt.Scale(domain=[0.9, 1]),
-                                             axis=alt.Axis(format="%"), title=None),
-                    color=alt.Color("metric:N", scale=alt.Scale(
-                        range=[LEGIT_COLOR, SCAM_COLOR, "#6B7385"]))),
-                width="stretch")
-        st.caption("A perfect test score on 80 postings does not mean the model is perfect: the "
-                   "test set is small and scammers will adapt once traits like the pay range "
-                   "are known to be checked.")
+    def table(name):
+        return pd.DataFrame(metrics[name]).T[["accuracy", "precision", "recall"]].astype(float).round(3)
+
+    st.subheader("Feature sets (cross-validation, k = 3)")
+    st.dataframe(table("feature_sets"))
+    st.subheader("Scaling (cross-validation, final features)")
+    st.dataframe(table("scaling_final"))
+    st.subheader("Choice of k (cross-validation)")
+    st.dataframe(table("k_values"))
+
+    st.caption("A perfect score on 80 test postings does not mean the model is perfect: the test set "
+               "is small, and scammers will change their postings once they know what we check.")

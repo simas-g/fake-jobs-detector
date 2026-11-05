@@ -1,17 +1,10 @@
-"""Evaluate the KNN model and justify every modelling choice.
+"""Choose the model with cross-validation, test it once, then train and save it.
 
-1. Hold out 20% of the postings as a test set (stratified, fixed seed).
-2. On the remaining 80%, compare scaling methods, feature sets and k with
-   5-fold cross-validation.
-3. Train the chosen setup on the full 80% and report it once on the test set.
-
-4. Train the final model once on all 400 reviewed postings and save it to
-   model/knn.pkl; the app loads that file instead of training.
-
-Writes results/metrics.json, which the app's "Model performance" tab reads.
-Usage:  python evaluate.py
+Run:  python evaluate.py
+Writes results/metrics.json (shown in the app) and model/knn.pkl (used by the app).
 """
 import json
+import os
 import pickle
 
 import numpy as np
@@ -20,126 +13,92 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler
 
 import db
-from features import CATEGORIES, FEATURES, build_features
+from features import prepare
 from knn import KNN
 
-SEED = 42
 
-RAW = ["salary_min", "salary_max", "no_salary", "required_experience_years",
-       "skills_listed", "vague_word_count", "exclamation_marks", "allcaps_ratio",
-       "posting_hour", "employer_response_delay_h", "is_remote", "free_mail_contact",
-       "company_age_months", "company_size", "mentions_trial_or_payment"] + \
-      [f"category_{c}" for c in CATEGORIES]
-
-FEATURE_SETS = {
-    "all raw columns": RAW,
-    "raw, without category": [f for f in RAW if not f.startswith("category_")],
-    "raw + salary width": RAW + ["salary_width"],
-    "final (8 features)": FEATURES,
-    "final, hour as plain number": [f for f in FEATURES if not f.startswith("hour_")] + ["posting_hour"],
-}
-
-
-def metrics(y_true, y_pred):
-    y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
-    tp = int(((y_pred == 1) & (y_true == 1)).sum())
-    tn = int(((y_pred == 0) & (y_true == 0)).sum())
-    fp = int(((y_pred == 1) & (y_true == 0)).sum())
-    fn = int(((y_pred == 0) & (y_true == 1)).sum())
-    precision = tp / (tp + fp) if tp + fp else 0.0
-    recall = tp / (tp + fn) if tp + fn else 0.0
+def scores(y, pred):
+    tp = int(((pred == 1) & (y == 1)).sum())
+    tn = int(((pred == 0) & (y == 0)).sum())
+    fp = int(((pred == 1) & (y == 0)).sum())
+    fn = int(((pred == 0) & (y == 1)).sum())
     return {
-        "accuracy": (tp + tn) / len(y_true),
-        "precision": precision,
-        "recall": recall,
-        "f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0,
+        "accuracy": (tp + tn) / len(y),
+        "precision": tp / (tp + fp) if tp + fp else 0,
+        "recall": tp / (tp + fn) if tp + fn else 0,
         "tp": tp, "tn": tn, "fp": fp, "fn": fn,
     }
 
 
 def cross_validate(X, y, k=3, scaling="standard"):
-    """Pooled out-of-fold predictions; the scaler is refit inside every fold."""
+    """5-fold CV; returns the scores over all out-of-fold predictions."""
     pred = np.zeros_like(y)
-    for tr, va in StratifiedKFold(5, shuffle=True, random_state=SEED).split(X, y):
-        pred[va] = KNN(k, scaling).fit(X[tr], y[tr]).predict(X[va])
-    return metrics(y, pred)
+    for train, val in StratifiedKFold(5, shuffle=True, random_state=42).split(X, y):
+        pred[val] = KNN(k, scaling).fit(X[train], y[train]).predict(X[val])
+    return scores(y, pred)
 
 
-def main():
-    conn, backend = db.connect()
-    df = db.run_query(conn, db.load_queries()["all_postings"]["sql"])
-    feats = build_features(df)
-    y = df["scam"].to_numpy(dtype=int)
+# ---- data
+posting, category, source = db.load_tables()
+df = db.run(db.ALL_POSTINGS, posting, category)
+y = df["scam"].to_numpy()
+print(f"{len(df)} postings from {source}")
 
-    train_idx, test_idx = train_test_split(
-        np.arange(len(df)), test_size=0.2, stratify=y, random_state=SEED)
-    y_tr, y_te = y[train_idx], y[test_idx]
-    print(f"data from {backend}: {len(df)} postings, train {len(train_idx)}, test {len(test_idx)}")
+# ---- feature sets to compare
+raw = df[["salary_min", "salary_max"]].fillna(df[["salary_min", "salary_max"]].median())
+raw["no_salary"] = df["salary_min"].isna().astype(int)
+for col in ["required_experience_years", "skills_listed", "vague_word_count", "exclamation_marks",
+            "allcaps_ratio", "posting_hour", "employer_response_delay_h", "is_remote",
+            "free_mail_contact", "company_age_months", "company_size", "mentions_trial_or_payment"]:
+    raw[col] = df[col]
+raw_without_category = raw.to_numpy(dtype=float)
+for name in category["name"]:
+    raw["category_" + name] = (df["category"] == name).astype(int)
+raw_all = raw.to_numpy(dtype=float)
 
-    def X_of(cols, idx):
-        return feats[cols].to_numpy(dtype=float)[idx]
+final = prepare(df)
+width = final[:, [0]]
+final_plain_hour = np.column_stack([final[:, [0, 1, 2, 3, 4, 7]], df["posting_hour"]])
 
-    results = {"backend": backend, "n_train": len(train_idx), "n_test": len(test_idx)}
+feature_sets = {
+    "all raw columns": raw_all,
+    "raw, without category": raw_without_category,
+    "raw + salary width": np.column_stack([raw_all, width]),
+    "final (8 features)": final,
+    "final, hour as plain number": final_plain_hour,
+}
 
-    print("\n5-fold CV on the training set, k=3")
-    results["scaling"] = {}
-    for scaling in [None, "minmax", "standard"]:
-        m = cross_validate(X_of(RAW, train_idx), y_tr, 3, scaling)
-        results["scaling"][str(scaling or "none")] = m
-        print(f"  scaling={str(scaling):9s} acc={m['accuracy']:.3f} prec={m['precision']:.3f} rec={m['recall']:.3f}")
+# ---- hold out 20% as a test set; every choice below uses only the other 80%
+train, test = train_test_split(np.arange(len(df)), test_size=0.2, stratify=y, random_state=42)
 
-    results["feature_sets"] = {}
-    for name, cols in FEATURE_SETS.items():
-        m = cross_validate(X_of(cols, train_idx), y_tr)
-        results["feature_sets"][name] = m
-        print(f"  {name:28s} acc={m['accuracy']:.3f} prec={m['precision']:.3f} rec={m['recall']:.3f}")
+results = {"source": source, "n_train": len(train), "n_test": len(test)}
+results["feature_sets"] = {name: cross_validate(X[train], y[train]) for name, X in feature_sets.items()}
+results["scaling_raw"] = {str(s): cross_validate(raw_all[train], y[train], scaling=s)
+                          for s in [None, "minmax", "standard"]}
+results["scaling_final"] = {str(s): cross_validate(final[train], y[train], scaling=s)
+                            for s in [None, "minmax", "standard"]}
+results["k_values"] = {str(k): cross_validate(final[train], y[train], k=k) for k in [1, 3, 5, 7, 9, 15]}
 
-    results["k_values"] = {}
-    for k in [1, 3, 5, 7, 9, 15]:
-        m = cross_validate(X_of(FEATURES, train_idx), y_tr, k)
-        results["k_values"][str(k)] = m
-        print(f"  k={k:2d} acc={m['accuracy']:.3f} prec={m['precision']:.3f} rec={m['recall']:.3f}")
+# ---- final setup, tested once on the test set
+model = KNN(k=3, scaling="standard").fit(final[train], y[train])
+test_pred = model.predict(final[test])
+results["test"] = scores(y[test], test_pred)
+results["baseline"] = scores(y[test], np.zeros_like(y[test]))  # always "legitimate"
 
-    # final model, evaluated once on the untouched test set
-    model = KNN(3, "standard").fit(X_of(FEATURES, train_idx), y_tr)
-    test_pred = model.predict(X_of(FEATURES, test_idx))
-    test = metrics(y_te, test_pred)
-    baseline = metrics(y_te, np.zeros_like(y_te))
-    results["test"] = test
-    results["baseline_always_legit"] = baseline
+# check our KNN against scikit-learn's
+scaler = StandardScaler().fit(final[train])
+sk = KNeighborsClassifier(3).fit(scaler.transform(final[train]), y[train])
+results["same_as_sklearn"] = bool((sk.predict(scaler.transform(final[test])) == test_pred).all())
 
-    # sanity check: scikit-learn's KNN must give the same predictions
-    sk = KNeighborsClassifier(3).fit(StandardScaler().fit_transform(X_of(FEATURES, train_idx)), y_tr)
-    sk_pred = sk.predict(StandardScaler().fit(X_of(FEATURES, train_idx)).transform(X_of(FEATURES, test_idx)))
-    results["matches_sklearn"] = bool((sk_pred == test_pred).all())
+for name, r in results["feature_sets"].items():
+    print(f"CV  {name:28s} accuracy {r['accuracy']:.3f}  recall {r['recall']:.3f}")
+t = results["test"]
+print(f"TEST accuracy {t['accuracy']:.3f}  precision {t['precision']:.3f}  recall {t['recall']:.3f}")
+print(f"Baseline accuracy {results['baseline']['accuracy']:.3f}, same as sklearn: {results['same_as_sklearn']}")
 
-    print(f"\nTEST SET (n={len(test_idx)}), k=3, final features")
-    print(f"  accuracy={test['accuracy']:.3f} precision={test['precision']:.3f} "
-          f"recall={test['recall']:.3f} f1={test['f1']:.3f}")
-    print(f"  confusion: TN={test['tn']} FP={test['fp']} FN={test['fn']} TP={test['tp']}")
-    print(f"  baseline always-legit accuracy={baseline['accuracy']:.3f}")
-    print(f"  identical to scikit-learn: {results['matches_sklearn']}")
-
-    missed = df.iloc[test_idx][test_pred != y_te]
-    results["test_errors"] = missed.to_dict(orient="records")
-    if len(missed):
-        print("\nmisclassified test postings:")
-        print(missed.to_string())
-
-    db.ROOT.joinpath("results").mkdir(exist_ok=True)
-    (db.ROOT / "results" / "metrics.json").write_text(json.dumps(results, indent=2, default=float))
-    print("\nwrote results/metrics.json")
-
-    # the model the app uses: same setup, trained once on the whole backlog so
-    # every reviewed posting can be shown as a neighbour
-    final = KNN(3, "standard").fit(feats[FEATURES].to_numpy(dtype=float), y)
-    db.MODEL_PATH.parent.mkdir(exist_ok=True)
-    db.MODEL_PATH.write_bytes(pickle.dumps({
-        "model": final, "features": FEATURES,
-        "posting_ids": df["posting_id"].astype(int).tolist(),
-    }))
-    print(f"saved the trained model to {db.MODEL_PATH.relative_to(db.ROOT)}")
-
-
-if __name__ == "__main__":
-    main()
+# ---- the model the app uses: same setup, trained on all 400 postings
+os.makedirs("model", exist_ok=True)
+os.makedirs("results", exist_ok=True)
+pickle.dump(KNN(k=3, scaling="standard").fit(final, y), open("model/knn.pkl", "wb"))
+json.dump(results, open("results/metrics.json", "w"), indent=2)
+print("Saved model/knn.pkl and results/metrics.json")

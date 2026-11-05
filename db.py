@@ -1,125 +1,53 @@
-"""Database access: PostgreSQL by default, SQLite in memory as a demo fallback.
+"""Get the two tables (posting, category) and run SQL on them with pandasql.
 
-Connection settings come from the usual libpq environment variables:
-PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD (defaults: localhost:5433/fakejobs).
+The tables come from PostgreSQL when it is running, otherwise straight from
+the CSV (Streamlit Cloud has no database).
 """
 import os
-import re
-import sqlite3
-from pathlib import Path
 
 import pandas as pd
+from pandasql import sqldf
+from sqlalchemy import create_engine
 
-ROOT = Path(__file__).parent
-CSV_PATH = ROOT / "data" / "fake_jobs.csv"
-SCHEMA_PATH = ROOT / "sql" / "schema.sql"
-QUERIES_PATH = ROOT / "sql" / "queries.sql"
-MODEL_PATH = ROOT / "model" / "knn.pkl"
-TABLES = ("category", "posting")
+CSV = "data/fake_jobs.csv"
+DB_URL = os.environ.get(
+    "DATABASE_URL", f"postgresql+psycopg2://{os.environ.get('USER')}@localhost:5433/fakejobs")
 
-POSTING_COLUMNS = [
-    "salary_min", "salary_max", "required_experience_years", "skills_listed",
-    "vague_word_count", "exclamation_marks", "allcaps_ratio", "posting_hour",
-    "employer_response_delay_h", "is_remote", "free_mail_contact",
-    "company_age_months", "company_size", "mentions_trial_or_payment", "scam",
-]
-
-
-def pg_settings():
-    return dict(
-        host=os.environ.get("PGHOST", "localhost"),
-        port=int(os.environ.get("PGPORT", "5433")),
-        dbname=os.environ.get("PGDATABASE", "fakejobs"),
-        user=os.environ.get("PGUSER", os.environ.get("USER", "postgres")),
-        password=os.environ.get("PGPASSWORD") or None,
-    )
+ALL_POSTINGS = """
+SELECT p.*, c.name AS category
+FROM posting p
+JOIN category c ON c.category_id = p.category_id
+ORDER BY p.posting_id
+"""
 
 
-def load_queries():
-    """Parse sql/queries.sql into {name: {"title": ..., "sql": ...}}."""
-    text = QUERIES_PATH.read_text()
-    queries = {}
-    for block in re.split(r"^-- name: ", text, flags=re.M)[1:]:
-        name, rest = block.split("\n", 1)
-        title = re.search(r"^-- title: (.*)$", rest, flags=re.M).group(1)
-        sql = "\n".join(l for l in rest.splitlines() if not l.startswith("--")).strip()
-        queries[name.strip()] = {"title": title.strip(), "sql": sql.rstrip(";")}
-    return queries
+def from_csv():
+    posting = pd.read_csv(CSV)
+    posting.insert(0, "posting_id", range(1, len(posting) + 1))
+
+    names = sorted(posting["category"].unique())
+    category = pd.DataFrame({"category_id": range(1, len(names) + 1), "name": names})
+
+    posting["category_id"] = posting["category"].map(dict(zip(category["name"], category["category_id"])))
+    posting = posting.drop(columns="category")
+    return posting, category
 
 
-def read_csv():
-    df = pd.read_csv(CSV_PATH)
-    df.insert(0, "posting_id", range(1, len(df) + 1))
-    return df
+def from_postgres():
+    engine = create_engine(DB_URL, connect_args={"connect_timeout": 3})
+    posting = pd.read_sql("SELECT * FROM posting ORDER BY posting_id", engine)
+    category = pd.read_sql("SELECT * FROM category ORDER BY category_id", engine)
+    return posting, category
 
 
-def insert_rows(conn, df, placeholder):
-    """Fill category and posting from the CSV dataframe."""
-    categories = sorted(df["category"].unique())
-    cat_id = {name: i + 1 for i, name in enumerate(categories)}
-    cur = conn.cursor()
-    cur.executemany(
-        f"INSERT INTO category (category_id, name) VALUES ({placeholder}, {placeholder})",
-        [(i, name) for name, i in cat_id.items()],
-    )
-    cols = ["posting_id"] + POSTING_COLUMNS + ["category_id"]
-    rows = []
-    for r in df.itertuples(index=False):
-        r = r._asdict()
-        values = [r["posting_id"]]
-        for c in POSTING_COLUMNS:
-            v = r[c]
-            if pd.isna(v):
-                v = None
-            elif c in ("salary_min", "salary_max", "skills_listed", "vague_word_count",
-                       "exclamation_marks", "posting_hour", "is_remote", "free_mail_contact",
-                       "company_age_months", "company_size", "mentions_trial_or_payment", "scam"):
-                v = int(v)
-            else:
-                v = float(v)
-            values.append(v)
-        values.append(cat_id[r["category"]])
-        rows.append(values)
-    cur.executemany(
-        f"INSERT INTO posting ({', '.join(cols)}) VALUES ({', '.join([placeholder] * len(cols))})",
-        rows,
-    )
-    conn.commit()
-
-
-def connect():
-    """Return (connection, backend name). Falls back to SQLite if Postgres is down."""
+def load_tables():
     try:
-        import psycopg2
-        conn = psycopg2.connect(connect_timeout=3, **pg_settings())
-        return conn, "PostgreSQL"
+        posting, category = from_postgres()
+        return posting, category, "PostgreSQL"
     except Exception:
-        conn = sqlite3.connect(":memory:", check_same_thread=False)
-        conn.executescript(SCHEMA_PATH.read_text())
-        insert_rows(conn, read_csv(), "?")
-        return conn, "SQLite (fallback: PostgreSQL unreachable)"
+        posting, category = from_csv()
+        return posting, category, "CSV (no database connection)"
 
 
-def run_query(conn, sql):
-    cur = conn.cursor()
-    cur.execute(sql)
-    cols = [d[0] for d in cur.description]
-    df = pd.DataFrame(cur.fetchall(), columns=cols)
-    # Postgres returns Decimal for AVG; make every numeric column a float
-    for c in df.columns:
-        if df[c].dtype == object:
-            converted = pd.to_numeric(df[c], errors="coerce")
-            if converted.notna().sum() == df[c].notna().sum():
-                df[c] = converted
-    return df
-
-
-def load_tables(conn):
-    """Read every table from the database into pandas DataFrames, once."""
-    return {t: run_query(conn, f"SELECT * FROM {t} ORDER BY 1") for t in TABLES}
-
-
-def sqldf(sql, tables):
-    """Run SQL on the pandas DataFrames with pandasql (SQLite dialect)."""
-    from pandasql import sqldf as _sqldf
-    return _sqldf(sql, dict(tables))
+def run(query, posting, category):
+    return sqldf(query, {"posting": posting, "category": category})

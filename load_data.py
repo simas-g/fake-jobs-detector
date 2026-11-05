@@ -1,40 +1,18 @@
-"""Create the fakejobs database (if needed), build the schema and import the CSV.
+"""Put data/fake_jobs.csv into PostgreSQL.
 
-Usage:  python load_data.py
+First create the database once:  createdb -p 5433 fakejobs
+Then run:                         python load_data.py
 """
-import psycopg2
-from psycopg2 import sql
+from sqlalchemy import create_engine
 
 import db
 
+posting, category = db.from_csv()
+engine = create_engine(db.DB_URL)
 
-def main():
-    settings = db.pg_settings()
+with engine.begin() as conn:
+    conn.exec_driver_sql(open("sql/schema.sql").read())
+    category.to_sql("category", conn, if_exists="append", index=False)
+    posting.to_sql("posting", conn, if_exists="append", index=False)  # empty salaries become NULL
 
-    # CREATE DATABASE cannot run inside a transaction, so use the maintenance db
-    admin = psycopg2.connect(**{**settings, "dbname": "postgres"})
-    admin.autocommit = True
-    with admin.cursor() as cur:
-        cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (settings["dbname"],))
-        if cur.fetchone() is None:
-            cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(settings["dbname"])))
-            print(f"created database {settings['dbname']}")
-    admin.close()
-
-    conn = psycopg2.connect(**settings)
-    with conn.cursor() as cur:
-        cur.execute(db.SCHEMA_PATH.read_text())
-    conn.commit()
-
-    df = db.read_csv()
-    db.insert_rows(conn, df, "%s")
-
-    with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*), SUM(scam), COUNT(*) - COUNT(salary_min) FROM posting")
-        n, scams, no_salary = cur.fetchone()
-    print(f"loaded {n} postings ({scams} scams, {no_salary} without a salary range)")
-    conn.close()
-
-
-if __name__ == "__main__":
-    main()
+print(f"Loaded {len(posting)} postings and {len(category)} categories.")

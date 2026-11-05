@@ -1,4 +1,4 @@
-"""k-nearest neighbours classifier written from scratch (numpy only)."""
+"""k-nearest neighbours: scale the features, Euclidean distance, majority vote."""
 import numpy as np
 
 
@@ -8,36 +8,26 @@ class KNN:
         self.scaling = scaling  # "standard", "minmax" or None
 
     def fit(self, X, y):
-        X = np.asarray(X, dtype=float)
         if self.scaling == "standard":
-            self.center_ = X.mean(axis=0)
-            self.scale_ = X.std(axis=0)
+            self.shift, self.scale = X.mean(axis=0), X.std(axis=0)
         elif self.scaling == "minmax":
-            self.center_ = X.min(axis=0)
-            self.scale_ = X.max(axis=0) - X.min(axis=0)
+            self.shift, self.scale = X.min(axis=0), X.max(axis=0) - X.min(axis=0)
         else:
-            self.center_ = np.zeros(X.shape[1])
-            self.scale_ = np.ones(X.shape[1])
-        self.scale_[self.scale_ == 0] = 1.0  # constant column: leave it unscaled
-        self.X_ = self._scale(X)
-        self.y_ = np.asarray(y, dtype=int)
+            self.shift, self.scale = 0, 1
+        self.scale = np.where(self.scale == 0, 1, self.scale)  # avoid dividing by 0
+
+        self.X = (X - self.shift) / self.scale
+        self.y = np.asarray(y)
         return self
 
-    def _scale(self, X):
-        return (np.asarray(X, dtype=float) - self.center_) / self.scale_
-
     def kneighbors(self, X):
-        """Indices (into the training set) and Euclidean distances of the k nearest."""
-        Xs = self._scale(np.atleast_2d(X))
-        dist = np.sqrt(((Xs[:, None, :] - self.X_[None, :, :]) ** 2).sum(axis=2))
-        idx = np.argsort(dist, axis=1, kind="stable")[:, : self.k]
-        return idx, np.take_along_axis(dist, idx, axis=1)
-
-    def predict_proba(self, X):
-        """Share of the k neighbours that are scams."""
-        idx, _ = self.kneighbors(X)
-        return self.y_[idx].mean(axis=1)
+        """Row numbers and distances of the k closest training postings."""
+        X = (X - self.shift) / self.scale
+        distances = np.sqrt(((X[:, None, :] - self.X[None, :, :]) ** 2).sum(axis=2))
+        nearest = np.argsort(distances, axis=1, kind="stable")[:, :self.k]
+        return nearest, np.take_along_axis(distances, nearest, axis=1)
 
     def predict(self, X):
-        # majority vote; with odd k there are no ties
-        return (self.predict_proba(X) > 0.5).astype(int)
+        nearest, _ = self.kneighbors(X)
+        votes = self.y[nearest].sum(axis=1)
+        return (votes > self.k / 2).astype(int)

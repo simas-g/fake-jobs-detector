@@ -1,7 +1,5 @@
--- Fake Jobs Detector: moderation backlog schema.
--- One row per reviewed job posting; the 8 job categories live in their own
--- table so a category name is stored once (no update anomalies).
--- Written in portable SQL so the same file also runs on SQLite (demo fallback).
+-- One row per reviewed job posting. The 8 job categories have their own
+-- table so each category name is stored only once.
 
 DROP TABLE IF EXISTS posting;
 DROP TABLE IF EXISTS category;
