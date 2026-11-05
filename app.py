@@ -364,6 +364,7 @@ with tab_model:
         with right:
             st.subheader("Choice of k (CV)")
             kv = cv_table("k_values").reset_index(names="k").melt("k", var_name="metric")
+            kv["k"] = kv["k"].astype(int)  # sort 1, 3, 5 ... 15, not as text
             st.altair_chart(
                 alt.Chart(kv).mark_line(point=True).encode(
                     x=alt.X("k:O"), y=alt.Y("value:Q", scale=alt.Scale(domain=[0.9, 1]),
