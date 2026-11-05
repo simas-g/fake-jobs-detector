@@ -126,11 +126,7 @@ st.title("🔎 Fake Jobs Detector")
 st.caption("Moderation support for the trust and safety team: which listing traits go with "
            "confirmed scams, and a verdict for new postings, explained by the 3 most similar "
            "reviewed postings.")
-if backend.startswith("SQLite"):
-    st.sidebar.info("Demo mode: the reviewed backlog is loaded from the CSV into an "
-                    "in-memory SQL database (PostgreSQL not configured).")
-else:
-    st.sidebar.success(f"Connected to {backend}")
+st.sidebar.caption("Data: PostgreSQL" if backend == "PostgreSQL" else "Data: CSV (no database connection)")
 st.sidebar.markdown("**Backlog**")
 _, _, ov = query("overview")
 st.sidebar.metric("Reviewed postings", int(ov.postings[0]))
