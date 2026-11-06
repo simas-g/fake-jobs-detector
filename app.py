@@ -204,11 +204,9 @@ with tab_model:
              f"5-fold cross-validation on {metrics['n_train']} postings, tested once on "
              f"{metrics['n_test']} postings the model never saw.")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2 = st.columns(2)
     c1.metric("Accuracy", f"{test['accuracy']:.1%}")
-    c2.metric("Precision", f"{test['precision']:.1%}")
-    c3.metric("Recall", f"{test['recall']:.1%}")
-    c4.metric("Baseline accuracy (always legitimate)", f"{baseline['accuracy']:.1%}")
+    c2.metric("Baseline accuracy (always legitimate)", f"{baseline['accuracy']:.1%}")
 
     st.subheader("Confusion matrix (test set)")
     st.dataframe(pd.DataFrame(
@@ -217,7 +215,7 @@ with tab_model:
         columns=["predicted legitimate", "predicted scam"]))
 
     def table(name):
-        return pd.DataFrame(metrics[name]).T[["accuracy", "precision", "recall"]].astype(float).round(3)
+        return pd.DataFrame(metrics[name]).T[["accuracy"]].astype(float).round(3)
 
     st.subheader("Feature sets (cross-validation, k = 3)")
     st.dataframe(table("feature_sets"))
